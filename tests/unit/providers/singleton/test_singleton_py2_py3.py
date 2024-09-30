@@ -15,9 +15,8 @@ PROVIDER_CLASSES = [
     providers.DelegatedThreadLocalSingleton,
     providers.ThreadSafeSingleton,
     providers.DelegatedThreadSafeSingleton,
+    providers.ContextLocalSingleton,
 ]
-if sys.version_info >= (3, 5):
-    PROVIDER_CLASSES.append(providers.ContextLocalSingleton)
 
 
 @fixture(params=PROVIDER_CLASSES)

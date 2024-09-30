@@ -2,6 +2,9 @@
 
 from __future__ import absolute_import
 
+import asyncio
+import builtins
+import configparser as iniconfigparser
 import copy
 import errno
 import functools
@@ -12,36 +15,19 @@ import os
 import re
 import sys
 import threading
-import types
 import warnings
+from inspect import isclass
+from contextvars import ContextVar
 
 try:
-    import contextvars
+    from inspect import _is_coroutine_marker
 except ImportError:
-    contextvars = None
+    _is_coroutine_marker = True
 
 try:
-    import builtins
+    from asyncio.coroutines import _is_coroutine
 except ImportError:
-    # Python 2.7
-    import __builtin__ as builtins
-
-try:
-    import asyncio
-except ImportError:
-    asyncio = None
-    _is_coroutine_marker = None
-else:
-    if sys.version_info >= (3, 5, 3):
-        import asyncio.coroutines
-        _is_coroutine_marker = asyncio.coroutines._is_coroutine
-    else:
-        _is_coroutine_marker = True
-
-try:
-    import ConfigParser as iniconfigparser
-except ImportError:
-    import configparser as iniconfigparser
+    _is_coroutine = True
 
 try:
     import yaml
@@ -59,25 +45,6 @@ from .errors import (
 )
 
 cimport cython
-
-
-if sys.version_info[0] == 3:  # pragma: no cover
-    CLASS_TYPES = (type,)
-else:  # pragma: no cover
-    CLASS_TYPES = (type, types.ClassType)
-
-    copy._deepcopy_dispatch[types.MethodType] = \
-        lambda obj, memo: type(obj)(obj.im_func,
-                                    copy.deepcopy(obj.im_self, memo),
-                                    obj.im_class)
-
-if sys.version_info[:2] == (3, 5):
-    warnings.warn(
-        "Dependency Injector will drop support of Python 3.5 after Jan 1st of 2022. "
-        "This does not mean that there will be any immediate breaking changes, "
-        "but tests will no longer be executed on Python 3.5, and bugs will not be addressed.",
-        category=DeprecationWarning,
-    )
 
 config_env_marker_pattern = re.compile(
     r"\${(?P<name>[^}^{:]+)(?P<separator>:?)(?P<default>.*?)}",
@@ -102,28 +69,15 @@ def _resolve_config_env_markers(config_content, envs_required=False):
     return config_content
 
 
-if sys.version_info[0] == 3:
-    def _parse_ini_file(filepath, envs_required=False):
-        parser = iniconfigparser.ConfigParser()
-        with open(filepath) as config_file:
-            config_string = _resolve_config_env_markers(
-                config_file.read(),
-                envs_required=envs_required,
-            )
-        parser.read_string(config_string)
-        return parser
-else:
-    import StringIO
-
-    def _parse_ini_file(filepath, envs_required=False):
-        parser = iniconfigparser.ConfigParser()
-        with open(filepath) as config_file:
-            config_string = _resolve_config_env_markers(
-                config_file.read(),
-                envs_required=envs_required,
-            )
-        parser.readfp(StringIO.StringIO(config_string))
-        return parser
+def _parse_ini_file(filepath, envs_required=False):
+    parser = iniconfigparser.ConfigParser()
+    with open(filepath) as config_file:
+        config_string = _resolve_config_env_markers(
+            config_file.read(),
+            envs_required=envs_required,
+        )
+    parser.read_string(config_string)
+    return parser
 
 
 if yaml:
@@ -872,10 +826,9 @@ cdef class Dependency(Provider):
 
     def set_instance_of(self, instance_of):
         """Set type."""
-        if not isinstance(instance_of, CLASS_TYPES):
+        if not isclass(instance_of):
             raise TypeError(
-                "\"instance_of\" has incorrect type (expected {0}, got {1}))".format(
-                    CLASS_TYPES,
+                "\"instance_of\" has incorrect type (expected type, got {0}))".format(
                     instance_of,
                 ),
             )
@@ -1434,7 +1387,8 @@ cdef class Coroutine(Callable):
         some_coroutine.add_kwargs(keyword_argument1=3, keyword_argument=4)
     """
 
-    _is_coroutine = _is_coroutine_marker
+    _is_coroutine_marker = _is_coroutine_marker  # Python >=3.12
+    _is_coroutine = _is_coroutine  # Python <3.12
 
     def set_provides(self, provides):
         """Set provider provides."""
@@ -1803,7 +1757,7 @@ cdef class ConfigurationOption(Provider):
                 "\"pip install dependency-injector[pydantic]\""
             )
 
-        if isinstance(settings, CLASS_TYPES) and issubclass(settings, pydantic.BaseSettings):
+        if isclass(settings) and issubclass(settings, pydantic.BaseSettings):
             raise Error(
                 "Got settings class, but expect instance: "
                 "instead \"{0}\" use \"{0}()\"".format(settings.__name__)
@@ -2372,7 +2326,7 @@ cdef class Configuration(Object):
                 "\"pip install dependency-injector[pydantic]\""
             )
 
-        if isinstance(settings, CLASS_TYPES) and issubclass(settings, pydantic.BaseSettings):
+        if isclass(settings) and issubclass(settings, pydantic.BaseSettings):
             raise Error(
                 "Got settings class, but expect instance: "
                 "instead \"{0}\" use \"{0}()\"".format(settings.__name__)
@@ -3254,15 +3208,8 @@ cdef class ContextLocalSingleton(BaseSingleton):
         :param provides: Provided type.
         :type provides: type
         """
-        if not contextvars:
-            raise RuntimeError(
-                "Contextvars library not found. This provider "
-                "requires Python 3.7 or a backport of contextvars. "
-                "To install a backport run \"pip install contextvars\"."
-            )
-
         super(ContextLocalSingleton, self).__init__(provides, *args, **kwargs)
-        self._storage = contextvars.ContextVar("_storage", default=self._none)
+        self._storage = ContextVar("_storage", default=self._none)
 
     def reset(self):
         """Reset cached instance, if any.
@@ -3967,18 +3914,14 @@ cdef class Resource(Provider):
 
     @staticmethod
     def _is_resource_subclass(instance):
-        if  sys.version_info < (3, 5):
-            return False
-        if not isinstance(instance, CLASS_TYPES):
+        if not isclass(instance):
             return
         from . import resources
         return issubclass(instance, resources.Resource)
 
     @staticmethod
     def _is_async_resource_subclass(instance):
-        if  sys.version_info < (3, 5):
-            return False
-        if not isinstance(instance, CLASS_TYPES):
+        if not isclass(instance):
             return
         from . import resources
         return issubclass(instance, resources.AsyncResource)
@@ -4835,7 +4778,7 @@ cpdef bint is_provider(object instance):
 
     :rtype: bool
     """
-    return (not isinstance(instance, CLASS_TYPES) and
+    return (not isclass(instance) and
             getattr(instance, "__IS_PROVIDER__", False) is True)
 
 
@@ -4863,7 +4806,7 @@ cpdef bint is_delegated(object instance):
 
     :rtype: bool
     """
-    return (not isinstance(instance, CLASS_TYPES) and
+    return (not isclass(instance) and
             getattr(instance, "__IS_DELEGATED__", False) is True)
 
 
@@ -4894,7 +4837,7 @@ cpdef bint is_container_instance(object instance):
 
     :rtype: bool
     """
-    return (not isinstance(instance, CLASS_TYPES) and
+    return (not isclass(instance) and
             getattr(instance, "__IS_CONTAINER__", False) is True)
 
 
@@ -4906,7 +4849,7 @@ cpdef bint is_container_class(object instance):
 
     :rtype: bool
     """
-    return (isinstance(instance, CLASS_TYPES) and
+    return (isclass(instance) and
             getattr(instance, "__IS_CONTAINER__", False) is True)
 
 
